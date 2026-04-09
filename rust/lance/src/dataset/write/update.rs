@@ -265,7 +265,7 @@ impl UpdateJob {
         // We keep track of seen row ids so we can delete them from the existing
         // fragments and then set the row id segments in the new fragments.
         let (stream, row_id_rx) =
-            make_rowid_capture_stream(stream, self.dataset.manifest.uses_stable_row_ids())?;
+            make_rowid_capture_stream(stream, self.dataset.manifest.uses_stable_row_ids(), None)?;
 
         let schema = stream.schema();
 

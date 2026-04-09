@@ -92,6 +92,7 @@ use super::rowids::load_row_id_sequences;
 use super::transaction::{
     Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder,
 };
+pub use super::utils::BatchObserver;
 use super::utils::make_rowid_capture_stream;
 use super::{WriteMode, WriteParams, write_fragments_internal};
 use crate::Dataset;
@@ -763,7 +764,7 @@ pub async fn compact_files_with_planner(
     let dataset_ref = &dataset.clone();
 
     let result_stream = futures::stream::iter(compaction_plan.tasks.into_iter())
-        .map(|task| rewrite_files(Cow::Borrowed(dataset_ref), task, &compaction_plan.options))
+        .map(|task| rewrite_files(Cow::Borrowed(dataset_ref), task, &compaction_plan.options, None))
         .buffer_unordered(
             compaction_plan
                 .options
@@ -882,6 +883,7 @@ async fn prepare_reader(
     batch_size: Option<usize>,
     with_frags: bool,
     capture_row_ids: bool,
+    batch_observer: Option<BatchObserver>,
 ) -> Result<(
     SendableRecordBatchStream,
     Option<std::sync::mpsc::Receiver<CapturedRowIds>>,
@@ -906,7 +908,7 @@ async fn prepare_reader(
         scanner.with_row_id();
         let data = SendableRecordBatchStream::from(scanner.try_into_stream().await?);
         let (data_no_row_ids, rx) =
-            make_rowid_capture_stream(data, dataset.manifest.uses_stable_row_ids())?;
+            make_rowid_capture_stream(data, dataset.manifest.uses_stable_row_ids(), batch_observer)?;
         Ok((data_no_row_ids, Some(rx)))
     } else {
         Ok((
@@ -944,12 +946,32 @@ impl CompactionTask {
     /// the read version for this task (the same version from which the
     /// compaction was planned).
     pub async fn execute(&self, dataset: &Dataset) -> Result<RewriteResult> {
+        self.execute_with_observer(dataset, None).await
+    }
+
+    /// Run the compaction task with an optional per-batch observer.
+    ///
+    /// `batch_observer`, if `Some`, is called once per [`RecordBatch`] scanned
+    /// from the old fragments **before** the `_rowid` column is stripped.  The
+    /// batch therefore contains both the vector columns and the old row
+    /// addresses, allowing the caller to build incremental indexes (e.g. IVF
+    /// posting lists) without buffering all raw vectors in memory.
+    ///
+    /// After this call returns, use [`RewriteResult::row_addrs`] together with
+    /// `transpose_row_addrs` to map old row addresses captured by the observer
+    /// to their final addresses once [`commit_compaction`] has assigned new
+    /// fragment IDs.
+    pub async fn execute_with_observer(
+        &self,
+        dataset: &Dataset,
+        batch_observer: Option<BatchObserver>,
+    ) -> Result<RewriteResult> {
         let dataset = if dataset.manifest.version == self.read_version {
             Cow::Borrowed(dataset)
         } else {
             Cow::Owned(dataset.checkout_version(self.read_version).await?)
         };
-        rewrite_files(dataset, self.task.clone(), &self.options).await
+        rewrite_files(dataset, self.task.clone(), &self.options, batch_observer).await
     }
 }
 
@@ -1124,6 +1146,7 @@ async fn rewrite_files(
     dataset: Cow<'_, Dataset>,
     task: TaskData,
     options: &CompactionOptions,
+    batch_observer: Option<BatchObserver>,
 ) -> Result<RewriteResult> {
     let mut metrics = CompactionMetrics::default();
 
@@ -1179,6 +1202,7 @@ async fn rewrite_files(
             options.batch_size,
             true,
             needs_remapping,
+            batch_observer,
         )
         .await?;
         row_ids_rx = rx_initial;
@@ -2603,11 +2627,11 @@ mod tests {
         let mut immediate_results = Vec::new();
 
         for (task, task2) in plan.tasks().iter().zip(plan2.tasks()) {
-            let deferred_result = rewrite_files(Cow::Borrowed(&dataset), task.clone(), &options)
+            let deferred_result = rewrite_files(Cow::Borrowed(&dataset), task.clone(), &options, None)
                 .await
                 .unwrap();
             let immediate_result =
-                rewrite_files(Cow::Borrowed(&dataset2), task2.clone(), &options2)
+                rewrite_files(Cow::Borrowed(&dataset2), task2.clone(), &options2, None)
                     .await
                     .unwrap();
 
@@ -2884,7 +2908,7 @@ mod tests {
         // Commit each rewrite task separately to simulate 3 compaction runs
         // being accumulated in the fragment reuse index
         for task in plan.tasks().iter() {
-            let rewrite_result = rewrite_files(Cow::Borrowed(&dataset), task.clone(), &options)
+            let rewrite_result = rewrite_files(Cow::Borrowed(&dataset), task.clone(), &options, None)
                 .await
                 .unwrap();
 
@@ -3163,7 +3187,7 @@ mod tests {
         let tasks = plan.tasks();
 
         // Only compact the first task, record the state of the dataset
-        let rewrite_result = rewrite_files(Cow::Borrowed(&dataset), tasks[0].clone(), &options)
+        let rewrite_result = rewrite_files(Cow::Borrowed(&dataset), tasks[0].clone(), &options, None)
             .await
             .unwrap();
 
@@ -3193,7 +3217,7 @@ mod tests {
         assert_eq!(frag_reuse_details.versions.len(), 1);
 
         // First commit the remaining 2 compaction tasks.
-        let rewrite_result2 = rewrite_files(Cow::Borrowed(&dataset), tasks[1].clone(), &options)
+        let rewrite_result2 = rewrite_files(Cow::Borrowed(&dataset), tasks[1].clone(), &options, None)
             .await
             .unwrap();
         let rewritten_frags2 = rewrite_result2
@@ -3221,7 +3245,7 @@ mod tests {
             .unwrap();
         let new_frags2 = frag_reuse_details2.versions.last().unwrap().new_frag_ids();
 
-        let rewrite_result3 = rewrite_files(Cow::Borrowed(&dataset), tasks[2].clone(), &options)
+        let rewrite_result3 = rewrite_files(Cow::Borrowed(&dataset), tasks[2].clone(), &options, None)
             .await
             .unwrap();
         let rewritten_frags3 = rewrite_result3
@@ -3301,7 +3325,7 @@ mod tests {
         let tasks = plan.tasks();
 
         // Only compact the first task, record the state of the dataset
-        let rewrite_result = rewrite_files(Cow::Borrowed(&dataset), tasks[0].clone(), &options)
+        let rewrite_result = rewrite_files(Cow::Borrowed(&dataset), tasks[0].clone(), &options, None)
             .await
             .unwrap();
 
@@ -3350,7 +3374,7 @@ mod tests {
         // Concurrently commit a rewrite
         // After rebase it should only contain the latest reuse version
         let rewrite_result2 =
-            rewrite_files(Cow::Borrowed(&dataset_clone), tasks[1].clone(), &options)
+            rewrite_files(Cow::Borrowed(&dataset_clone), tasks[1].clone(), &options, None)
                 .await
                 .unwrap();
         let rewritten_frags2 = rewrite_result2
@@ -3413,7 +3437,7 @@ mod tests {
         let mut dataset_clone = dataset.clone();
 
         // Only compact the first task, record the state of the dataset
-        let rewrite_result = rewrite_files(Cow::Borrowed(&dataset), tasks[0].clone(), &options)
+        let rewrite_result = rewrite_files(Cow::Borrowed(&dataset), tasks[0].clone(), &options, None)
             .await
             .unwrap();
 
@@ -3441,7 +3465,7 @@ mod tests {
 
         // Concurrently commit a rewrite should fail
         let rewrite_result2 =
-            rewrite_files(Cow::Borrowed(&dataset_clone), tasks[1].clone(), &options)
+            rewrite_files(Cow::Borrowed(&dataset_clone), tasks[1].clone(), &options, None)
                 .await
                 .unwrap();
         let result = commit_compaction(

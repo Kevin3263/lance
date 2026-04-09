@@ -40,12 +40,26 @@ fn extract_row_ids(
     Ok(batch.project(non_row_id_projection)?)
 }
 
+/// A callback invoked once per [`RecordBatch`] during a compaction scan,
+/// **before** the `_rowid` column is stripped from the batch.
+///
+/// The batch passed to the observer still contains the `_rowid` column
+/// (old row addresses as `UInt64`), alongside all data columns.  The observer
+/// can use this to build incremental indexes without buffering raw vectors.
+///
+/// Signature: `fn(batch: &RecordBatch)`
+pub type BatchObserver = Arc<dyn Fn(&RecordBatch) + Send + Sync>;
+
 /// Given a stream that includes a row id column, return a stream that will
 /// capture the row id. At completion of the stream, the captured row ids can
 /// be received from the returned receiver.
+///
+/// If `batch_observer` is `Some`, it is called once per batch **before** the
+/// `_rowid` column is stripped.  Passing `None` preserves the original behavior.
 pub fn make_rowid_capture_stream(
     mut target: SendableRecordBatchStream,
     stable_row_ids: bool,
+    batch_observer: Option<BatchObserver>,
 ) -> Result<(SendableRecordBatchStream, Receiver<CapturedRowIds>)> {
     let mut row_ids = CapturedRowIds::new(stable_row_ids);
 
@@ -62,6 +76,9 @@ pub fn make_rowid_capture_stream(
 
     let stream = futures::stream::poll_fn(move |cx| match target.poll_next_unpin(cx) {
         std::task::Poll::Ready(Some(Ok(batch))) => {
+            if let Some(obs) = &batch_observer {
+                obs(&batch);
+            }
             let res = extract_row_ids(&mut row_ids, batch, row_id_idx, &non_row_ids_cols);
             std::task::Poll::Ready(Some(res))
         }
