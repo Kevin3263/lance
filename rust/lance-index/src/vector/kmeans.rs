@@ -1367,17 +1367,24 @@ where
         )));
     }
 
-    // Only sample sample_rate * num_clusters. See Faiss
+    // Only sample sample_rate * num_clusters. See Faiss.
+    // Use random sampling (not a prefix slice) so the training set is
+    // representative when the dataset has any insertion-order bias.
     let data = if num_rows > sample_rate * k {
+        let sample_size = sample_rate * k;
         log::info!(
             "Sample {} out of {} to train kmeans of {} dim, {} clusters",
-            sample_rate * k,
-            array.len() / dimension,
+            sample_size,
+            num_rows,
             dimension,
             k,
         );
-        let sample_size = sample_rate * k;
-        array.slice(0, sample_size * dimension)
+        let mut rng = SmallRng::from_os_rng();
+        let chosen = (0..num_rows).choose_multiple(&mut rng, sample_size);
+        let flat: Vec<T::Native> = chosen.into_iter()
+            .flat_map(|i| array.values()[i * dimension..(i + 1) * dimension].iter().copied())
+            .collect();
+        PrimitiveArray::<T>::from_iter_values(flat)
     } else {
         array.clone()
     };
