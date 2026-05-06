@@ -274,6 +274,17 @@ impl L2Prepared {
     pub fn size_bytes(&self) -> usize {
         self.transposed.len() * std::mem::size_of::<f32>()
     }
+
+    /// Reconstruct the `t`-th original target vector by gathering across the
+    /// transposed buffer. Cost: O(dimension) reads.
+    ///
+    /// Panics if `t >= num_targets`.
+    pub fn row(&self, t: usize) -> Vec<f32> {
+        assert!(t < self.num_targets, "row index {t} out of range {}", self.num_targets);
+        (0..self.dimension)
+            .map(|d| self.transposed[d * self.num_targets + t])
+            .collect()
+    }
 }
 
 /// Compute L2 distance between two vectors.
