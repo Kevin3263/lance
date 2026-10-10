@@ -1104,7 +1104,12 @@ pub struct RewriteResult {
     pub row_addrs: Option<Vec<u8>>,
 }
 
-async fn reserve_fragment_ids(
+/// Reserve `fragments.len()` fragment ids in one `ReserveFragments` commit and
+/// assign them to the given fragments. Public since 2026-10-10 for the design
+/// engine (lance-ivf repo, DESIGN.md §6): ids are reserved in blocks before
+/// the output files are written, so the engine's log can name a file by its
+/// fragment id before the commit that adds it.
+pub async fn reserve_fragment_ids(
     dataset: &Dataset,
     fragments: impl ExactSizeIterator<Item = &mut Fragment>,
 ) -> Result<()> {
